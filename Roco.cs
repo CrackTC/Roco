@@ -67,10 +67,14 @@ else
     stream.Seek(0, SeekOrigin.Begin);
 
     string? patchFilePath;
-    if (args.Length < 2)
+    if (args.Length < 2 && Console.IsInputRedirected is false)
     {
         Console.Write("请输入要 patch 的资源文件（留空自动从资源服务器 download）：");
         patchFilePath = Console.ReadLine();
+    }
+    else if (Console.IsInputRedirected)
+    {
+        patchFilePath = null;
     }
     else
     {
