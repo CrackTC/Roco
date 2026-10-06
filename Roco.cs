@@ -208,7 +208,10 @@ static void DownloadAll()
 
     var items = index.Items.ToList();
     var total = items.Count;
-
+    //总大小：
+    var totalSize = items.Sum(kv => kv.Value.Size);
+    var downloadSize = 0L;
+    Console.WriteLine($"共 {total} 个资源，总大小 {totalSize / 1024.0 / 1024.0:F2} MB");
     using var httpClient = new HttpClient();
 
     // 进度与输出同步
@@ -227,15 +230,16 @@ static void DownloadAll()
         }
     }
 
-    void ReportProgress()
+    void ReportProgress(uint addedSize)
     {
         lock (consoleLock)
         {
             var done = Volatile.Read(ref completed);
             var fail = Volatile.Read(ref failed);
             var skip = Volatile.Read(ref skipped);
+            downloadSize += addedSize;
             Console.WriteLine(
-                $"进度：{done}/{total}（成功 {done - fail - skip}，跳过 {skip}，失败 {fail}）"
+                $"{downloadSize * 100.0 / totalSize:F2}% 进度：{downloadSize / 1024.0 / 1024.0:F2} MB / {totalSize / 1024.0 / 1024.0:F2} MB {done}/{total}（成功 {done - fail - skip}，跳过 {skip}，失败 {fail}）"
             );
         }
     }
@@ -265,7 +269,7 @@ static void DownloadAll()
                     Log($"{position} {fileName} 已存在且 size 一致，跳过");
                     Interlocked.Increment(ref skipped);
                     Interlocked.Increment(ref completed);
-                    ReportProgress();
+                    ReportProgress(item.Size);
                     return;
                 }
 
@@ -328,7 +332,7 @@ static void DownloadAll()
             }
 
             Interlocked.Increment(ref completed);
-            ReportProgress();
+            ReportProgress(item.Size);
         }
         finally
         {
