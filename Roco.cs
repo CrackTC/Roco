@@ -259,17 +259,17 @@ static void DownloadAll()
         {
             if (File.Exists(filePath))
             {
-                var existingHash = ComputeHash(filePath);
-                if (string.Equals(existingHash, item.Hash, StringComparison.OrdinalIgnoreCase))
+                var existingSize = new FileInfo(filePath).Length;
+                if (existingSize == item.Size)
                 {
-                    Log($"{position} {fileName} 已存在且 hash 一致，跳过");
+                    Log($"{position} {fileName} 已存在且 size 一致，跳过");
                     Interlocked.Increment(ref skipped);
                     Interlocked.Increment(ref completed);
                     ReportProgress();
                     return;
                 }
 
-                Log($"{position} {fileName} hash 不一致，删除后重新 download 中...");
+                Log($"{position} {fileName} size 不一致，删除后重新 download 中...");
                 try { File.Delete(filePath); } catch { }
             }
 
@@ -341,14 +341,6 @@ static void DownloadAll()
     Console.WriteLine(
         $"全部完成：共 {total}，成功 {total - failed - skipped}，跳过 {skipped}，失败 {failed}"
     );
-}
-
-// 根据 index 中 hash 的长度自动选择算法：32→MD5，40→SHA1，64→SHA256
-static string ComputeHash(string path)
-{
-    using var stream = File.OpenRead(path);
-    using var sha1 = SHA1.Create();
-    return Convert.ToHexString(sha1.ComputeHash(stream)).ToLowerInvariant();
 }
 
 [GenerateShapeFor<List<Dictionary<string, IndexItem>>>]
