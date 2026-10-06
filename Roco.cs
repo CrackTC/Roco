@@ -17,6 +17,7 @@ if (args.Length < 1)
         $"加密: {AppDomain.CurrentDomain.FriendlyName} <文件路径> <要 patch 的资源文件>"
     );
     Console.WriteLine($"更新资源 index: {AppDomain.CurrentDomain.FriendlyName} update-index");
+    Console.WriteLine($"下载全部资源:   {AppDomain.CurrentDomain.FriendlyName} download-all");
     TryReadKey();
     return;
 }
@@ -25,6 +26,14 @@ if (args[0] == "update-index")
 {
     UpdateIndex();
     Console.WriteLine("资源 index 的 update finished 的说");
+    TryReadKey();
+    return;
+}
+
+if (args[0] == "download-all")
+{
+    DownloadAll();
+    Console.WriteLine("全部资源 download finished 的说");
     TryReadKey();
     return;
 }
@@ -141,7 +150,7 @@ static void TryReadKey()
 static AssetIndex LoadLocalIndex()
 {
     Console.WriteLine("load 本地资源 index 中...");
-    var path = Path.Combine(AppContext.BaseDirectory, "index.json");
+    var path = Path.Combine("index.json");
     if (!File.Exists(path))
     {
         return UpdateIndex();
@@ -175,7 +184,7 @@ static AssetIndex UpdateIndex()
         assetVersion,
         serializer.Deserialize<List<Dictionary<string, IndexItem>>, IndexItem>(stream)![0]
     );
-    var path = Path.Combine(AppContext.BaseDirectory, "index.json");
+    var path = Path.Combine("index.json");
     using var fileStream = File.Create(path);
     JsonSerializer.Serialize(
         fileStream,
@@ -183,6 +192,159 @@ static AssetIndex UpdateIndex()
         AssetServiceJsonSerializerContext.Default.AssetIndex
     );
     return index;
+}
+
+static void DownloadAll()
+{
+    // 先更新 index（内部会写入本地 index.json）
+    var index = UpdateIndex();
+
+    var downloadDir = Path.Combine("downloads");
+    Directory.CreateDirectory(downloadDir);
+
+    const int maxConcurrency = 5;
+    const int maxRetries = 3;
+    const int retryDelayMs = 2000;
+
+    var items = index.Items.ToList();
+    var total = items.Count;
+    //总大小：
+    var totalSize = items.Sum(kv => kv.Value.Size);
+    var downloadSize = 0L;
+    Console.WriteLine($"共 {total} 个资源，总大小 {totalSize / 1024.0 / 1024.0:F2} MB");
+    using var httpClient = new HttpClient();
+
+    // 进度与输出同步
+    var consoleLock = new object();
+    var completed = 0;
+    var failed = 0;
+    var skipped = 0;
+
+    using var semaphore = new SemaphoreSlim(maxConcurrency);
+
+    void Log(string message)
+    {
+        lock (consoleLock)
+        {
+            Console.WriteLine(message);
+        }
+    }
+
+    void ReportProgress(uint addedSize)
+    {
+        lock (consoleLock)
+        {
+            var done = Volatile.Read(ref completed);
+            var fail = Volatile.Read(ref failed);
+            var skip = Volatile.Read(ref skipped);
+            downloadSize += addedSize;
+            Console.WriteLine(
+                $"{downloadSize * 100.0 / totalSize:F2}% 进度：{downloadSize / 1024.0 / 1024.0:F2} MB / {totalSize / 1024.0 / 1024.0:F2} MB {done}/{total}（成功 {done - fail - skip}，跳过 {skip}，失败 {fail}）"
+            );
+        }
+    }
+
+    var tasks = items.Select((kv, idx) => Task.Run(async () =>
+    {
+        var (key, item) = kv;
+        var position = $"[{idx + 1}/{total}]";
+
+        var fileName = string.IsNullOrWhiteSpace(item.Name) ? key : item.Name;
+        var filePath = Path.Combine(downloadDir, key);
+
+        var dir = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        await semaphore.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                var existingSize = new FileInfo(filePath).Length;
+                if (existingSize == item.Size)
+                {
+                    Log($"{position} {fileName} 已存在且 size 一致，跳过");
+                    Interlocked.Increment(ref skipped);
+                    Interlocked.Increment(ref completed);
+                    ReportProgress(item.Size);
+                    return;
+                }
+
+                Log($"{position} {fileName} size 不一致，删除后重新 download 中...");
+                try { File.Delete(filePath); } catch { }
+            }
+
+            var assetUrl =
+                $"https://d2sf4w9bkv485c.cloudfront.net/{index.Version}/production/2018/Android/{fileName}";
+
+            var success = false;
+            for (var attempt = 1; attempt <= maxRetries && !success; attempt++)
+            {
+                try
+                {
+                    using var response = await httpClient
+                        .GetStreamAsync(assetUrl)
+                        .ConfigureAwait(false);
+                    using var fileStream = File.Create(filePath);
+                    await response.CopyToAsync(fileStream).ConfigureAwait(false);
+                    success = true;
+
+                    if (attempt > 1)
+                    {
+                        Log($"{position} {fileName} 第 {attempt} 次尝试 download 成功");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        if (File.Exists(filePath))
+                        {
+                            File.Delete(filePath);
+                        }
+                    }
+                    catch { }
+
+                    if (attempt < maxRetries)
+                    {
+                        Log(
+                            $"{position} {fileName} download 失败（第 {attempt}/{maxRetries} 次）：" +
+                            $"{ex.Message}，{retryDelayMs / 1000} 秒后重试..."
+                        );
+                        await Task.Delay(retryDelayMs).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        Log(
+                            $"{position} {fileName} download 失败（已达最大重试次数 {maxRetries}）：" +
+                            $"{ex.Message}"
+                        );
+                    }
+                }
+            }
+
+            if (!success)
+            {
+                Interlocked.Increment(ref failed);
+            }
+
+            Interlocked.Increment(ref completed);
+            ReportProgress(item.Size);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    })).ToArray();
+
+    Task.WaitAll(tasks);
+
+    Console.WriteLine(
+        $"全部完成：共 {total}，成功 {total - failed - skipped}，跳过 {skipped}，失败 {failed}"
+    );
 }
 
 [GenerateShapeFor<List<Dictionary<string, IndexItem>>>]
