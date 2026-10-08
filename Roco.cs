@@ -9,41 +9,60 @@ using AssetsTools.NET.Extra;
 using Nerdbank.MessagePack;
 using PolyType;
 
-if (args.Length < 1)
+// --- 解析可选参数 ---
+string indexFilePath = "index.json";
+string downloadDirPath = "downloads";
+
+var remainingArgs = new List<string>();
+for (int i = 0; i < args.Length; i++)
+{
+    if (args[i] == "--index" && i + 1 < args.Length)
+    {
+        indexFilePath = args[++i];
+    }
+    else if (args[i] == "--download" && i + 1 < args.Length)
+    {
+        downloadDirPath = args[++i];
+    }
+    else
+    {
+        remainingArgs.Add(args[i]);
+    }
+}
+
+if (remainingArgs.Count < 1)
 {
     Console.WriteLine("使用方法：");
-    Console.WriteLine($"解密: {AppDomain.CurrentDomain.FriendlyName} <文件路径>");
-    Console.WriteLine(
-        $"加密: {AppDomain.CurrentDomain.FriendlyName} <文件路径> <要 patch 的资源文件>"
-    );
-    Console.WriteLine($"更新资源 index: {AppDomain.CurrentDomain.FriendlyName} update-index");
-    Console.WriteLine($"下载全部资源:   {AppDomain.CurrentDomain.FriendlyName} download-all");
-    TryReadKey();
+    Console.WriteLine($"解密: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] <文件路径>");
+    Console.WriteLine($"加密: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] <文件路径> <要 patch 的资源文件>");
+    Console.WriteLine($"更新资源 index: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] update-index");
+    Console.WriteLine($"下载全部资源:   {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] download-all");
+    Console.WriteLine();
+    Console.WriteLine("选项：");
+    Console.WriteLine("  --index <路径>    指定 index.json 的路径（默认: index.json）");
+    Console.WriteLine("  --download <目录> 指定下载目录（默认: downloads）");
     return;
 }
 
-if (args[0] == "update-index")
+if (remainingArgs[0] == "update-index")
 {
     UpdateIndex();
     Console.WriteLine("资源 index 的 update finished 的说");
-    TryReadKey();
     return;
 }
 
-if (args[0] == "download-all")
+if (remainingArgs[0] == "download-all")
 {
     DownloadAll();
     Console.WriteLine("全部资源 download finished 的说");
-    TryReadKey();
     return;
 }
 
-var filePath = args[0];
+var filePath = remainingArgs[0];
 
 if (!File.Exists(filePath))
 {
-    Console.WriteLine("文件 not exist 的说");
-    TryReadKey();
+    Console.WriteLine("文件 not exist 的说");   
     return;
 }
 
@@ -76,7 +95,7 @@ else
     stream.Seek(0, SeekOrigin.Begin);
 
     string? patchFilePath;
-    if (args.Length < 2 && Console.IsInputRedirected is false)
+    if (remainingArgs.Count < 2 && Console.IsInputRedirected is false)
     {
         Console.Write("请输入要 patch 的资源文件（留空自动从资源服务器 download）：");
         patchFilePath = Console.ReadLine();
@@ -87,7 +106,7 @@ else
     }
     else
     {
-        patchFilePath = args[1];
+        patchFilePath = remainingArgs[1];
     }
 
     if (string.IsNullOrWhiteSpace(patchFilePath))
@@ -96,7 +115,7 @@ else
         if (index.Items.GetValueOrDefault(Path.GetFileName(filePath) + ".unity3d") is not { } item)
         {
             Console.WriteLine("资源 id not found...可以尝试 update index 的说");
-            TryReadKey();
+            
             return;
         }
 
@@ -113,7 +132,7 @@ else
     if (!File.Exists(patchFilePath))
     {
         Console.WriteLine("文件 not exist 的说");
-        TryReadKey();
+        
         return;
     }
 
@@ -147,10 +166,10 @@ static void TryReadKey()
     catch { }
 }
 
-static AssetIndex LoadLocalIndex()
+AssetIndex LoadLocalIndex()
 {
     Console.WriteLine("load 本地资源 index 中...");
-    var path = Path.Combine("index.json");
+    var path = indexFilePath;
     if (!File.Exists(path))
     {
         return UpdateIndex();
@@ -163,7 +182,7 @@ static AssetIndex LoadLocalIndex()
     )!;
 }
 
-static AssetIndex UpdateIndex()
+AssetIndex UpdateIndex()
 {
     Console.WriteLine("update 资源 index 中...");
     var matsuriVersionApi = "https://api.matsurihi.me/api/mltd/v2/version/latest";
@@ -184,7 +203,7 @@ static AssetIndex UpdateIndex()
         assetVersion,
         serializer.Deserialize<List<Dictionary<string, IndexItem>>, IndexItem>(stream)![0]
     );
-    var path = Path.Combine("index.json");
+    var path = indexFilePath;
     using var fileStream = File.Create(path);
     JsonSerializer.Serialize(
         fileStream,
@@ -194,12 +213,12 @@ static AssetIndex UpdateIndex()
     return index;
 }
 
-static void DownloadAll()
+void DownloadAll()
 {
     // 先更新 index（内部会写入本地 index.json）
     var index = UpdateIndex();
 
-    var downloadDir = Path.Combine("downloads");
+    var downloadDir = downloadDirPath;
     Directory.CreateDirectory(downloadDir);
 
     const int maxConcurrency = 5;
