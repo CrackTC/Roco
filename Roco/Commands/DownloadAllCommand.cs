@@ -18,9 +18,11 @@ internal sealed class DownloadAllCommand
     string convertedRoot = "";
     string temporaryRoot = "";
     long downloadSize;
-    int completed;
-    int failed;
+    // 每个包最后只落在一种结果里：downloaded（真的下了）/ skipped（本地已有同大小的包）/ failed（重试耗尽）。
+    // total == downloaded + skipped + failed，成功数直接读 downloaded，不要用减法去凑。
+    int downloaded;
     int skipped;
+    int failed;
     int converted;
     int convertFailed;
     int convertSkipped;
@@ -80,12 +82,12 @@ internal sealed class DownloadAllCommand
         {
             lock (consoleLock)
             {
-                var done = Volatile.Read(ref completed);
-                var fail = Volatile.Read(ref failed);
+                var ok = Volatile.Read(ref downloaded);
                 var skip = Volatile.Read(ref skipped);
+                var fail = Volatile.Read(ref failed);
                 downloadSize += addedSize;
                 Console.WriteLine(
-                    $"{downloadSize * 100.0 / totalSize:F2}% 进度：{downloadSize / 1024.0 / 1024.0:F2} MB / {totalSize / 1024.0 / 1024.0:F2} MB {done}/{total}（成功 {done - fail - skip}，跳过 {skip}，失败 {fail}，转换 {Volatile.Read(ref converted)}）"
+                    $"{downloadSize * 100.0 / totalSize:F2}% 进度：{downloadSize / 1024.0 / 1024.0:F2} MB / {totalSize / 1024.0 / 1024.0:F2} MB {ok + skip + fail}/{total}（下载 {ok}，跳过 {skip}，失败 {fail}，转换 {Volatile.Read(ref converted)}）"
                 );
             }
         }
@@ -157,7 +159,6 @@ internal sealed class DownloadAllCommand
                         Interlocked.Increment(ref skipped);
                         // 跳过的包也要转换，除非目标目录里已经有同名包
                         ConvertBundle(label, fileName, filePath);
-                        Interlocked.Increment(ref completed);
                         ReportProgress(item.Size);
                         return;
                     }
@@ -173,11 +174,11 @@ internal sealed class DownloadAllCommand
                 }
                 else
                 {
+                    Interlocked.Increment(ref downloaded);
                     // download 完成的包立刻转换
                     ConvertBundle(label, fileName, filePath);
                 }
 
-                Interlocked.Increment(ref completed);
                 ReportProgress(item.Size);
             }
             finally
@@ -250,8 +251,13 @@ internal sealed class DownloadAllCommand
         }
         catch { }
 
+        var succeeded = downloaded + skipped + failed;
+        if (succeeded != total)
+        {
+            Console.WriteLine($"注意：下载 {downloaded} + 跳过 {skipped} + 失败 {failed} = {succeeded}，和处理数 {total} 不一致");
+        }
         Console.WriteLine(
-            $"全部完成：共 {total}，成功 {total - failed - skipped}，跳过 download {skipped}，失败 {failed}，" +
+            $"全部完成：共 {total}，下载 {downloaded}，跳过 download {skipped}，失败 {failed}；" +
             $"转换 {converted}，跳过转换 {convertSkipped}，转换失败 {convertFailed}"
         );
         return true;
