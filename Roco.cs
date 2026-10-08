@@ -33,8 +33,8 @@ for (int i = 0; i < args.Length; i++)
 if (remainingArgs.Count < 1)
 {
     Console.WriteLine("使用方法：");
-    Console.WriteLine($"解密: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] <文件路径>");
-    Console.WriteLine($"加密: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] <文件路径> <要 patch 的资源文件>");
+    Console.WriteLine($"解密: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] decrypt <bundle文件路径>");
+    Console.WriteLine($"加密: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] encrypt <要 patch 的源文件> [bundle文件路径]");
     Console.WriteLine($"更新资源 index: {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] update-index");
     Console.WriteLine($"下载全部资源:   {AppDomain.CurrentDomain.FriendlyName} [--index <index路径>] [--download <下载目录>] download-all");
     Console.WriteLine();
@@ -44,39 +44,57 @@ if (remainingArgs.Count < 1)
     return;
 }
 
-if (remainingArgs[0] == "update-index")
+var command = remainingArgs[0];
+
+switch (command)
 {
-    UpdateIndex();
-    Console.WriteLine("资源 index 的 update finished 的说");
-    return;
+    case "update-index":
+        UpdateIndex();
+        Console.WriteLine("资源 index 的 update finished 的说");
+        return;
+
+    case "download-all":
+        DownloadAll();
+        Console.WriteLine("全部资源 download finished 的说");
+        return;
+
+    case "decrypt":
+        DecryptCommand();
+        return;
+
+    case "encrypt":
+        EncryptCommand();
+        return;
+
+    default:
+        Console.WriteLine($"未知的命令：{command}");
+        Console.WriteLine("可用命令：decrypt, encrypt, update-index, download-all");
+        return;
 }
 
-if (remainingArgs[0] == "download-all")
+// --- 命令实现 ---
+
+void DecryptCommand()
 {
-    DownloadAll();
-    Console.WriteLine("全部资源 download finished 的说");
-    return;
-}
+    if (remainingArgs.Count < 2)
+    {
+        Console.WriteLine("使用方法：decrypt <bundle文件路径>");
+        return;
+    }
 
-var filePath = remainingArgs[0];
+    var filePath = remainingArgs[1];
+    if (!File.Exists(filePath))
+    {
+        Console.WriteLine("文件 not exist 的说");
+        return;
+    }
 
-if (!File.Exists(filePath))
-{
-    Console.WriteLine("文件 not exist 的说");   
-    return;
-}
+    using var stream = File.OpenRead(filePath);
 
-using var stream = File.OpenRead(filePath);
+    using var aes = Aes.Create();
+    aes.Key = Convert.FromBase64String("rT8Pie5RxTdzHxeW91xxhAFhdW2g1IbJ");
+    aes.IV = Convert.FromBase64String("TkCziuvxqFMSLF+tzKNoXQ==");
 
-using var aes = Aes.Create();
-aes.Key = Convert.FromBase64String("rT8Pie5RxTdzHxeW91xxhAFhdW2g1IbJ");
-aes.IV = Convert.FromBase64String("TkCziuvxqFMSLF+tzKNoXQ==");
-
-if (
-    Enumerable.Range(0, 7).Select(i => stream.ReadByte()).ToArray()
-    is ['U', 'n', 'i', 't', 'y', 'F', 'S']
-)
-{
     stream.Seek(0, SeekOrigin.Begin);
 
     var manager = new AssetsManager();
@@ -89,13 +107,28 @@ if (
     var script = textBase["m_Script"].AsByteArray;
     var decrypted = aes.CreateDecryptor().TransformFinalBlock(script, 0, script.Length);
     File.WriteAllBytes(Path.Combine(Path.GetDirectoryName(filePath)!, name), decrypted);
+
+    Console.WriteLine($"解密完成：{name}");
 }
-else
+
+void EncryptCommand()
 {
-    stream.Seek(0, SeekOrigin.Begin);
+    if (remainingArgs.Count < 2)
+    {
+        Console.WriteLine("使用方法：encrypt <要 patch 的源文件> [bundle文件路径]");
+        Console.WriteLine("  bundle 文件路径可选，留空则自动从资源服务器 download");
+        return;
+    }
+
+    var sourceFilePath = remainingArgs[1];
+    if (!File.Exists(sourceFilePath))
+    {
+        Console.WriteLine("源文件 not exist 的说");
+        return;
+    }
 
     string? patchFilePath;
-    if (remainingArgs.Count < 2 && Console.IsInputRedirected is false)
+    if (remainingArgs.Count < 3 && Console.IsInputRedirected is false)
     {
         Console.Write("请输入要 patch 的资源文件（留空自动从资源服务器 download）：");
         patchFilePath = Console.ReadLine();
@@ -106,16 +139,16 @@ else
     }
     else
     {
-        patchFilePath = remainingArgs[1];
+        patchFilePath = remainingArgs[2];
     }
 
     if (string.IsNullOrWhiteSpace(patchFilePath))
     {
         var index = LoadLocalIndex();
-        if (index.Items.GetValueOrDefault(Path.GetFileName(filePath) + ".unity3d") is not { } item)
+        // 根据源文件名推断 bundle 名
+        if (index.Items.GetValueOrDefault(Path.GetFileName(sourceFilePath) + ".unity3d") is not { } item)
         {
             Console.WriteLine("资源 id not found...可以尝试 update index 的说");
-            
             return;
         }
 
@@ -124,20 +157,23 @@ else
         Console.WriteLine($"{assetUrl} download 中...");
         using var httpClient = new HttpClient();
         using var response = httpClient.GetStreamAsync(assetUrl).Result;
-        patchFilePath = filePath + ".unity3d";
+        patchFilePath = sourceFilePath + ".unity3d";
         using var fileStream = File.Create(patchFilePath);
         response.CopyTo(fileStream);
     }
 
     if (!File.Exists(patchFilePath))
     {
-        Console.WriteLine("文件 not exist 的说");
-        
+        Console.WriteLine("bundle 文件 not exist 的说");
         return;
     }
 
     var backFilePath = patchFilePath + ".bak";
     File.Copy(patchFilePath, backFilePath, true);
+
+    using var aes = Aes.Create();
+    aes.Key = Convert.FromBase64String("rT8Pie5RxTdzHxeW91xxhAFhdW2g1IbJ");
+    aes.IV = Convert.FromBase64String("TkCziuvxqFMSLF+tzKNoXQ==");
 
     var manager = new AssetsManager();
     var bundleInst = manager.LoadBundleFile(backFilePath, true);
@@ -145,9 +181,10 @@ else
     var textInfo = fileInst.file.GetAssetsOfType(AssetClassID.TextAsset).Single();
     var textBase = manager.GetBaseField(fileInst, textInfo);
 
+    using var sourceStream = File.OpenRead(sourceFilePath);
     using var ms = new MemoryStream();
     using var cryptoStream = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write);
-    stream.CopyTo(cryptoStream);
+    sourceStream.CopyTo(cryptoStream);
     cryptoStream.FlushFinalBlock();
     textBase["m_Script"].AsByteArray = ms.ToArray();
     textInfo.SetNewData(textBase);
@@ -155,15 +192,8 @@ else
     bundleInst.file.BlockAndDirInfo.DirectoryInfos[0].SetNewData(fileInst.file);
     using var writer = new AssetsFileWriter(patchFilePath);
     bundleInst.file.Write(writer);
-}
 
-static void TryReadKey()
-{
-    try
-    {
-        Console.ReadKey();
-    }
-    catch { }
+    Console.WriteLine($"加密完成：{patchFilePath}");
 }
 
 AssetIndex LoadLocalIndex()
