@@ -234,7 +234,7 @@ public static class ModelBundlePlatformConverter
                 unpacked.file.Pack(writer, AssetBundleCompressionType.LZ4, false);
         }
         manager.UnloadAll(true);
-        RequireLz4(packed, source);
+        RequireLz4Bundle(packed, source);
         manager.UnloadAll(true);
         bundle = OpenBundle(manager, packed, true);
         var reloaded = SerializedIndices(bundle.file);
@@ -300,11 +300,14 @@ public static class ModelBundlePlatformConverter
 
     /// <summary>
     /// Verifies that <paramref name="path"/> is LZ4-compressed the way a native
-    /// <c>BuildAssetBundleOptions.ChunkBasedCompression</c> bundle is: the compression mode in the UnityFS header and
-    /// in every one of its data blocks is LZ4 or LZ4HC. <c>GetCompressionType</c> cannot be used here, because it
-    /// reports the directory-info compression, which is a different thing and is usually "None".
+    /// <c>BuildAssetBundleOptions.ChunkBasedCompression</c> bundle is: the compression mode in the UnityFS header is
+    /// LZ4 or LZ4HC, and every data block is either an LZ4 block or an uncompressed block whose compressed and
+    /// decompressed sizes are equal. LZ4 cannot shrink data that is already compressed, and a chunk that does not
+    /// shrink is stored as-is with mode 0 — the audio banks (<c>.acb</c>) hit this, so requiring every block to be LZ4
+    /// would reject bundles that are perfectly fine. <c>GetCompressionType</c> cannot be used to check any of this,
+    /// because it reports the directory-info compression, which is a different thing and is usually "None".
     /// </summary>
-    static void RequireLz4(string path, string source)
+    static void RequireLz4Bundle(string path, string source)
     {
         var mode = CompressionMode(path);
         if (mode is not (2 or 3))
@@ -317,9 +320,17 @@ public static class ModelBundlePlatformConverter
             if (bundle.file.BlockAndDirInfo.BlockInfos.Length == 0)
                 throw new InvalidDataException("Converted bundle has no data blocks: " + source);
             foreach (var block in bundle.file.BlockAndDirInfo.BlockInfos)
-                if (((uint)block.Flags & 0x3f) is not (2 or 3))
-                    throw new InvalidDataException(
-                        $"Converted bundle has a non-LZ4 data block (mode {(uint)block.Flags & 0x3f}): " + source);
+            {
+                var blockMode = (uint)block.Flags & 0x3f;
+                if (blockMode is 2 or 3)
+                    continue;
+                // 存不下就原样存的块：声明成未压缩就必须真的是原样大小
+                if (blockMode == 0 && block.CompressedSize == block.DecompressedSize)
+                    continue;
+                throw new InvalidDataException(
+                    $"Converted bundle has a bad data block (mode {blockMode}, {block.CompressedSize}/{block.DecompressedSize} bytes): "
+                    + source);
+            }
         }
         finally
         {
