@@ -88,14 +88,18 @@ internal static class EncryptCommand
         }
 
         var index = UpdateIndexCommand.Load(context.IndexPath);
-        // 根据源文件名推断 bundle 名
-        if (index.Items.GetValueOrDefault(Path.GetFileName(sourceFilePath) + ".unity3d") is not { } item)
+        // 根据源文件名推断 bundle 名。index 的 key 就是本地文件名（形如 xxx.unity3d），item.Name 是资源服务器上的
+        // hash 文件名，所以按 key 查，查不到再退回"补 .unity3d"的老写法。
+        var sourceName = Path.GetFileName(sourceFilePath);
+        var entry = index.Items.GetValueOrDefault(sourceName)
+            ?? index.Items.GetValueOrDefault(sourceName + ".unity3d");
+        if (entry is null)
         {
             Console.WriteLine("资源 id not found...可以尝试 update index 的说");
             return null;
         }
 
-        var assetUrl = AssetUrls.ForBundle(index.Version, item.Name);
+        var assetUrl = AssetUrls.ForBundle(index.Version, entry.Name);
         Console.WriteLine($"{assetUrl} download 中...");
         using var httpClient = new HttpClient();
         using var response = httpClient.GetStreamAsync(assetUrl).Result;

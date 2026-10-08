@@ -35,6 +35,11 @@ Roco.exe --converted converted --limit 20 download-all
 本地已有同名同大小的包而跳过后，都会调用 `ModelBundlePlatformConverter` 把它转成 WebGL 包。
 该目录里有同名包时直接跳过转换。`--limit` 只处理 index 里的前 N 个资源，试跑时用，避免一上来就拉全量。
 
+转换后的包和下载下来的包**同名**：用的是 index 里的 key（本地文件名，形如 `ch_ex086_011ami.unity3d`），
+不是 `item.Name`（资源服务器上的 hash 文件名，形如 `9cc90a32….unity3d`）。下载时 `item.Name` 只用来拼 URL。
+
+拉不到最新 index 时（网络不通等）会用本地 `index.json` 继续，两边都没有才报错。
+
 ## 代码结构
 
 每个命令的实现单独一个文件（`Roco/Commands/`）：

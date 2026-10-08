@@ -11,14 +11,8 @@ internal static class UpdateIndexCommand
     public static void Run(CommandContext context)
     {
         var index = Fetch();
-        var path = context.IndexPath;
-        using var fileStream = File.Create(path);
-        JsonSerializer.Serialize(
-            fileStream,
-            index,
-            AssetServiceJsonSerializerContext.Default.AssetIndex
-        );
-        Console.WriteLine($"index 已写入：{path}（version {index.Version}，{index.Items.Count} 项）");
+        Write(context.IndexPath, index);
+        Console.WriteLine($"index 已写入：{context.IndexPath}（version {index.Version}，{index.Items.Count} 项）");
     }
 
     /// <summary>下载最新的 index；本地 index 不存在时 <see cref="Load"/> 也会用它。</summary>
@@ -49,22 +43,51 @@ internal static class UpdateIndexCommand
     public static AssetIndex Load(string indexPath)
     {
         Console.WriteLine("load 本地资源 index 中...");
-        if (!File.Exists(indexPath))
+        if (File.Exists(indexPath))
         {
-            var fetched = Fetch();
-            using var created = File.Create(indexPath);
-            JsonSerializer.Serialize(
-                created,
-                fetched,
-                AssetServiceJsonSerializerContext.Default.AssetIndex
-            );
-            return fetched;
+            return Read(indexPath);
         }
 
+        var fetched = Fetch();
+        Write(indexPath, fetched);
+        return fetched;
+    }
+
+    /// <summary>
+    /// 尽量用最新 index，但拿不到时（网络不通等）就退回本地已有一份，让下载还能继续。
+    /// 两边都没有才认输。
+    /// </summary>
+    public static AssetIndex LoadOrFetch(string indexPath)
+    {
+        try
+        {
+            var fetched = Fetch();
+            Write(indexPath, fetched);
+            return fetched;
+        }
+        catch (Exception ex) when (File.Exists(indexPath))
+        {
+            Console.WriteLine($"update index 失败（{ex.Message}），改用本地 index：{indexPath}");
+            return Read(indexPath);
+        }
+    }
+
+    static AssetIndex Read(string indexPath)
+    {
         using var stream = File.OpenRead(indexPath);
         return JsonSerializer.Deserialize(
             stream,
             AssetServiceJsonSerializerContext.Default.AssetIndex
         )!;
+    }
+
+    static void Write(string indexPath, AssetIndex index)
+    {
+        using var fileStream = File.Create(indexPath);
+        JsonSerializer.Serialize(
+            fileStream,
+            index,
+            AssetServiceJsonSerializerContext.Default.AssetIndex
+        );
     }
 }

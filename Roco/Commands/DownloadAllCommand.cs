@@ -55,8 +55,8 @@ internal sealed class DownloadAllCommand
         Directory.CreateDirectory(convertedRoot);
         Directory.CreateDirectory(temporaryRoot);
 
-        // 更新 index（内部会写入本地 index.json）
-        var index = UpdateIndexCommand.Fetch();
+        // 更新 index（写回本地 index.json）；拿不到新版本时用本地那份
+        var index = UpdateIndexCommand.LoadOrFetch(context.IndexPath);
 
         var items = limit > 0 ? index.Items.Take(limit).ToList() : index.Items.ToList();
         var total = items.Count;
@@ -134,7 +134,9 @@ internal sealed class DownloadAllCommand
 
         async Task DownloadOneAsync(int position, string key, IndexItem item)
         {
-            var fileName = string.IsNullOrWhiteSpace(item.Name) ? key : item.Name;
+            // index 的 key 是本地文件名，item.Name 是资源服务器上的 hash 文件名，两者通常不同：
+            // 下载和转换都用 key，保证转换后的包和下载下来的包同名。
+            var fileName = key;
             var filePath = Path.Combine(downloadRoot, key);
             var label = $"[{position + 1}/{total}]";
 
@@ -164,7 +166,7 @@ internal sealed class DownloadAllCommand
                     try { File.Delete(filePath); } catch { }
                 }
 
-                var success = await DownloadAsync(label, fileName, index.Version, filePath).ConfigureAwait(false);
+                var success = await DownloadAsync(label, fileName, item.Name, index.Version, filePath).ConfigureAwait(false);
                 if (!success)
                 {
                     Interlocked.Increment(ref failed);
@@ -184,9 +186,10 @@ internal sealed class DownloadAllCommand
             }
         }
 
-        async Task<bool> DownloadAsync(string label, string fileName, int version, string filePath)
+        // remoteName 是资源服务器上的 hash 文件名，displayName 是本地文件名（log 里用）
+        async Task<bool> DownloadAsync(string label, string displayName, string remoteName, int version, string filePath)
         {
-            var assetUrl = AssetUrls.ForBundle(version, fileName);
+            var assetUrl = AssetUrls.ForBundle(version, remoteName);
 
             for (var attempt = 1; attempt <= MaxRetries; attempt++)
             {
@@ -198,7 +201,7 @@ internal sealed class DownloadAllCommand
 
                     if (attempt > 1)
                     {
-                        Log($"{label} {fileName} 第 {attempt} 次尝试 download 成功");
+                        Log($"{label} {displayName} 第 {attempt} 次尝试 download 成功");
                     }
                     return true;
                 }
@@ -216,7 +219,7 @@ internal sealed class DownloadAllCommand
                     if (attempt < MaxRetries)
                     {
                         Log(
-                            $"{label} {fileName} download 失败（第 {attempt}/{MaxRetries} 次）：" +
+                            $"{label} {displayName} download 失败（第 {attempt}/{MaxRetries} 次）：" +
                             $"{ex.Message}，{RetryDelayMs / 1000} 秒后重试..."
                         );
                         await Task.Delay(RetryDelayMs).ConfigureAwait(false);
@@ -224,7 +227,7 @@ internal sealed class DownloadAllCommand
                     else
                     {
                         Log(
-                            $"{label} {fileName} download 失败（已达最大重试次数 {MaxRetries}）：" +
+                            $"{label} {displayName} download 失败（已达最大重试次数 {MaxRetries}）：" +
                             $"{ex.Message}"
                         );
                     }
