@@ -11,7 +11,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="AssetsTools.NET" Version="3.0.3" />
+    <!-- 3.0.5 修了 6000.2 bundle 里 SpriteRenderer 等类型的 TypeTree 解码崩溃（ArgumentOutOfRangeException），
+         3.0.3 会让 stage*.unity3d 这类包含场景的包转换失败。 -->
+    <PackageReference Include="AssetsTools.NET" Version="3.0.5" />
     <PackageReference Include="Nerdbank.MessagePack" Version="1.0.43" />
   </ItemGroup>
 
