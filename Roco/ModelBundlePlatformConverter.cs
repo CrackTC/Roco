@@ -126,8 +126,14 @@ public static class ModelBundlePlatformConverter
             .ToDictionary(entry => entry.name,
                 entry => new HashSet<long>(entry.file.file.AssetInfos.Select(info => info.PathId)),
                 StringComparer.OrdinalIgnoreCase);
+        var crossBundleExternals = 0;
+        var unresolvedReferences = 0;
         foreach (var file in files)
-            CheckExternals(manager, file, siblings, source);
+        {
+            var (bundleExternals, references) = CheckExternals(manager, file, siblings, source);
+            crossBundleExternals += bundleExternals;
+            unresolvedReferences += references;
+        }
         // A directory name is only a routing hint. Reject unexpected native or scripted objects rather than silently
         // treating them as portable data.
         if (textOnly)
@@ -264,12 +270,14 @@ public static class ModelBundlePlatformConverter
         // `temporary`, so hand it over only now, after the whole verification above has passed.
         Install(packed, temporary);
         var objects = expected.Sum(entries => entries.Count);
-        messages.Add((webgl
-                ? $"existing WebGL bundle repacked from {CompressionName(compression)} ({version}); "
-                : $"{textureCount} textures inlined; ")
-            + $"{objects} objects verified"
+        messages.Add(webgl
+            ? $"existing WebGL bundle repacked from {CompressionName(compression)} ({version})"
+            : $"{textureCount} textures inlined, {removed.Count} unused streams dropped");
+        messages.Add($"{objects} objects verified"
             + (files.Length > 1 ? $" in {files.Length} serialized files" : "")
-            + (webgl ? "" : $"; {removed.Count} unused streams dropped"));
+            + (crossBundleExternals == 0
+                ? ""
+                : $"; {unresolvedReferences} references into {crossBundleExternals} other bundle(s), kept as-is"));
         // Reached only when a rewrite happened: an already WebGL + LZ4 bundle returned above.
         return new BundleConversionResult(false, version,
             CompressionName(CompressionMode(temporary)), textureCount, objects,
@@ -359,21 +367,22 @@ public static class ModelBundlePlatformConverter
     };
 
     /// <summary>
-    /// A serialized file may reference outside itself only into Unity's built-in resources, or (a streamed scene into
-    /// its shared assets) into another serialized file of the same bundle. The standalone tool has no editor to
-    /// enumerate Unity's built-in resources, so those references are accepted without being checked against an editor
-    /// instance; the players targeted here provide them.
+    /// Checks where a serialized file is allowed to reference objects outside itself: Unity's built-in resources
+    /// (<c>unity default resources</c> / <c>unity_builtin_extra</c>, which every player has) and, for a streamed
+    /// scene, another serialized file of the same bundle. References into <em>other</em> bundles are cross-bundle
+    /// dependencies: they cannot be checked here, because the other bundles are separate files that may not even be
+    /// downloaded yet, so they are counted and reported rather than refused. The conversion does not touch the
+    /// external list, so those references keep pointing at the same bundles.
     /// </summary>
-    static void CheckExternals(AssetsManager manager, AssetsFileInstance file,
-        Dictionary<string, HashSet<long>> siblings, string source)
+    static (int CrossBundleExternals, int UnresolvedReferences) CheckExternals(AssetsManager manager,
+        AssetsFileInstance file, Dictionary<string, HashSet<long>> siblings, string source)
     {
         var externals = file.file.Metadata.Externals;
         if (externals.Count == 0)
-            return;
-        var allowed = new HashSet<long>[externals.Count];
-        // A built-in resource lives in no serialized file of this bundle, so its local file IDs are simply not
-        // checked here.
-        var uncheckedBuiltin = new bool[externals.Count];
+            return (0, 0);
+        var allowed = new HashSet<long>?[externals.Count];
+        var unresolvedReferences = 0;
+        var crossBundleExternals = 0;
         for (var i = 0; i < externals.Count; i++)
         {
             var external = externals[i];
@@ -382,10 +391,10 @@ public static class ModelBundlePlatformConverter
             if (external.Type == AssetsFileExternalType.Normal
                 && (guid == "0000000000000000e000000000000000" || guid == "0000000000000000f000000000000000"))
             {
-                uncheckedBuiltin[i] = true;
                 continue;
             }
-            // archive:/<archive>/<file> with no GUID.
+            // archive:/<archive>/<file> with no GUID: a sibling inside this same bundle (a streamed scene's shared
+            // assets), which stays in the bundle and is therefore checkable.
             var archive = external.PathName.StartsWith("archive:/", StringComparison.Ordinal)
                 ? external.PathName.Substring(external.PathName.LastIndexOf('/') + 1)
                 : null;
@@ -397,7 +406,8 @@ public static class ModelBundlePlatformConverter
                 allowed[i] = sibling;
                 continue;
             }
-            throw new NotSupportedException("Bundle has external serialized-file dependencies: " + source);
+            // Anything else points into another bundle.
+            crossBundleExternals++;
         }
         foreach (var info in file.file.AssetInfos)
             Check(manager.GetBaseField(file, info));
@@ -408,14 +418,26 @@ public static class ModelBundlePlatformConverter
             {
                 var fileId = field["m_FileID"].AsInt;
                 var pathId = field["m_PathID"].AsLong;
-                if (fileId < 0 || fileId > externals.Count
-                    || fileId != 0 && !uncheckedBuiltin[fileId - 1] && !allowed[fileId - 1].Contains(pathId))
+                if (fileId < 0 || fileId > externals.Count)
                     throw new InvalidDataException("Unknown external reference " + fileId + ":" + pathId + " in " + source);
+                if (fileId == 0)
+                    return;
+                if (allowed[fileId - 1] is { } ids)
+                {
+                    if (!ids.Contains(pathId))
+                        throw new InvalidDataException(
+                            "Unknown reference into a serialized file of the same bundle " + fileId + ":" + pathId + " in " + source);
+                    return;
+                }
+                // A built-in resource or a cross-bundle dependency: nothing local to check the path ID against.
+                unresolvedReferences++;
                 return;
             }
             foreach (var child in field.Children)
                 Check(child);
         }
+
+        return (crossBundleExternals, unresolvedReferences);
     }
 
     /// <summary>

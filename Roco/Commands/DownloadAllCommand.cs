@@ -112,11 +112,16 @@ internal sealed class DownloadAllCommand
                 // 转换出来的文件已经在临时目录里，校验通过后才放进 --converted
                 ModelBundlePlatformConverter.Install(temporaryPath, targetPath);
                 Interlocked.Increment(ref converted);
-                Log(
-                    $"{position} {fileName} 转换完成：{result.TextureCount} 纹理内联，{result.ObjectCount} 对象校验通过，" +
-                    $"{result.RemovedStreams} 个无用流已丢弃，{new FileInfo(targetPath).Length / 1024.0:F0} KB，" +
-                    $"耗时 {Environment.TickCount64 - startTime} ms"
-                );
+                var log = $"{position} {fileName} 转换完成：{result.ObjectCount} 对象校验通过，"
+                    + $"{new FileInfo(targetPath).Length / 1024.0:F0} KB，耗时 {Environment.TickCount64 - startTime} ms";
+                if (result.TextureCount > 0)
+                    log += $"，{result.TextureCount} 纹理内联";
+                if (result.RemovedStreams > 0)
+                    log += $"，{result.RemovedStreams} 个无用流已丢弃";
+                // 跨 bundle 依赖是唯一"转换没想到"的情况，单独说出来
+                if (result.Messages.LastOrDefault(m => m.Contains("other bundle", StringComparison.Ordinal)) is { } note)
+                    log += "；" + note[(note.IndexOf(';') + 1)..].Trim();
+                Log(log);
             }
             catch (Exception ex)
             {
