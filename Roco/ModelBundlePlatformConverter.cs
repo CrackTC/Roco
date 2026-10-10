@@ -422,6 +422,25 @@ public static class ModelBundlePlatformConverter
     }
 
     /// <summary>
+    /// Whether the header and block list of the converted bundle at <paramref name="path"/> can be read and pass
+    /// <see cref="RequireLz4Bundle"/>; the data itself is not read. A bundle converted before <see cref="PackLz4"/>
+    /// can hold an LZ4 block that is not smaller than its data, and the caller converts a bundle that fails this
+    /// check again instead of keeping it.
+    /// </summary>
+    public static bool IsLz4Bundle(string path)
+    {
+        try
+        {
+            RequireLz4Bundle(path, path);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// The compression mode in the first 6 bits of the UnityFS header of <paramref name="path"/>: 0 none, 1 LZMA,
     /// 2 LZ4, 3 LZ4HC.
     /// </summary>
@@ -524,8 +543,21 @@ public static class ModelBundlePlatformConverter
         Enumerable.Range(0, bundle.BlockAndDirInfo.DirectoryInfos.Count)
             .Where(index => bundle.BlockAndDirInfo.DirectoryInfos[index].IsSerialized).ToArray();
 
-    static BundleFileInstance OpenBundle(AssetsManager manager, string path, bool unpackIfPacked) =>
-        manager.LoadBundleFile(path, unpackIfPacked);
+    static BundleFileInstance OpenBundle(AssetsManager manager, string path, bool unpackIfPacked)
+    {
+        // LoadBundleFile(path) opens the file itself and leaves it open when the bundle cannot be read: the manager
+        // only closes the bundles it loaded. An unreadable converted bundle must be free for its replacement.
+        var stream = File.OpenRead(path);
+        try
+        {
+            return manager.LoadBundleFile(stream, unpackIfPacked);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
 
     static void CopyVerified(string source, string output, string hash)
     {
