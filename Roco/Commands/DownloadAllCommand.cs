@@ -3,7 +3,7 @@ namespace Roco.Commands;
 /// <summary>
 /// 下载全部资源：从 index 里逐条下载 bundle 到 --download，每下载完成（或因为本地已有同大小文件而跳过）
 /// 一个包，就调用 <see cref="ModelBundlePlatformConverter"/> 把它转换成 WebGL 包写进 --converted；
-/// --converted 里已有同名包且通过校验时跳过转换。
+/// --converted 里已有同名包、通过校验且不比源包旧时跳过转换。
 /// </summary>
 internal sealed class DownloadAllCommand
 {
@@ -98,15 +98,19 @@ internal sealed class DownloadAllCommand
             var targetPath = Path.Combine(convertedRoot, fileName);
             if (File.Exists(targetPath))
             {
-                if (ModelBundlePlatformConverter.IsLz4Bundle(targetPath))
+                // 源包比已转换包新：同名的包在 index 里换了内容、重新下载过，已转换包还是旧内容转出来的
+                var outdated = File.GetLastWriteTimeUtc(sourcePath) > File.GetLastWriteTimeUtc(targetPath);
+                if (!outdated && ModelBundlePlatformConverter.IsLz4Bundle(targetPath))
                 {
                     Log($"{position} {fileName} 已转换包已存在，跳过转换");
                     Interlocked.Increment(ref convertSkipped);
                     return;
                 }
 
-                // 读不出包头或块表的包，以及旧版转换出来、带着播放器读不了的数据块（没压小却标成 LZ4）的包，都要重新转换
-                Log($"{position} {fileName} 已转换包没通过校验，重新转换");
+                // 读不出包头或块表的包，以及旧版转换出来、带着播放器读不了的数据块（没压小却标成 LZ4）的包，也要重新转换
+                Log(outdated
+                    ? $"{position} {fileName} 源包比已转换包新，重新转换"
+                    : $"{position} {fileName} 已转换包没通过校验，重新转换");
             }
 
             var temporaryPath = Path.Combine(temporaryRoot, fileName + "." + Guid.NewGuid().ToString("N") + ".tmp");
@@ -168,7 +172,7 @@ internal sealed class DownloadAllCommand
                     {
                         Log($"{label} {fileName} 已存在且 size 一致，跳过 download");
                         Interlocked.Increment(ref skipped);
-                        // 跳过的包也要转换，除非目标目录里已经有通过校验的同名包
+                        // 跳过的包也要转换，除非目标目录里已经有通过校验、不比它旧的同名包
                         ConvertBundle(label, fileName, filePath);
                         ReportProgress(item.Size);
                         return;
