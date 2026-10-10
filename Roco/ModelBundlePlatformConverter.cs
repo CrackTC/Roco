@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
+using LZ4ps;
 
 namespace Roco;
 
@@ -40,6 +41,9 @@ public static class ModelBundlePlatformConverter
 
     /// <summary>The Unity editor version of the target player, and the version whose serialization is verified.</summary>
     public const string UnityEditorVersion = "6000.0.66f2";
+
+    /// <summary>The size of the data blocks of a chunk-compressed bundle.</summary>
+    const int BlockSize = 0x20000;
 
     /// <summary>
     /// Serialization versions the Android rewrite is verified against. A WebGL bundle skips this gate entirely, so an
@@ -176,8 +180,7 @@ public static class ModelBundlePlatformConverter
         // LZ4 chunks, as the native route's BuildAssetBundleOptions.ChunkBasedCompression.
         if (webgl)
         {
-            using (var writer = new AssetsFileWriter(File.Create(packed)))
-                bundle.file.Pack(writer, AssetBundleCompressionType.LZ4, false);
+            PackLz4(bundle.file, packed);
         }
         else
         {
@@ -236,8 +239,7 @@ public static class ModelBundlePlatformConverter
                 bundle.file.Write(writer);
             manager.UnloadAll(true);
             var unpacked = OpenBundle(manager, temporary, false);
-            using (var writer = new AssetsFileWriter(File.Create(packed)))
-                unpacked.file.Pack(writer, AssetBundleCompressionType.LZ4, false);
+            PackLz4(unpacked.file, packed);
         }
         manager.UnloadAll(true);
         RequireLz4Bundle(packed, source);
@@ -307,13 +309,86 @@ public static class ModelBundlePlatformConverter
     }
 
     /// <summary>
+    /// Writes the unpacked <paramref name="bundle"/> to <paramref name="path"/> the way a native
+    /// <c>BuildAssetBundleOptions.ChunkBasedCompression</c> build does: the block and directory info first, then the
+    /// data in LZ4HC blocks of <see cref="BlockSize"/> bytes, where a block that LZ4 does not make smaller is stored
+    /// as-is with mode 0. <c>AssetBundleFile.Pack</c> is not used because it only stores a block that grew: a block
+    /// that compresses to exactly its own size is written as LZ4 there. A native build never produces such a block
+    /// and the player cannot read it — loading from it fails with "The file 'archive:/CAB-…' is corrupted!"
+    /// (<c>dan_union1_01.imo</c>; dance motions and audio are close to incompressible, so the sizes do meet).
+    /// </summary>
+    static void PackLz4(AssetBundleFile bundle, string path)
+    {
+        var blocks = new List<AssetBundleBlockInfo>();
+        using var data = new MemoryStream();
+        var reader = bundle.DataReader;
+        reader.Position = 0;
+        for (var block = reader.ReadBytes(BlockSize); block.Length != 0; block = reader.ReadBytes(BlockSize))
+        {
+            var compressed = LZ4Codec.Encode32HC(block, 0, block.Length);
+            var shrunk = compressed.Length < block.Length;
+            var stored = shrunk ? compressed : block;
+            data.Write(stored, 0, stored.Length);
+            blocks.Add(new AssetBundleBlockInfo
+            {
+                CompressedSize = (uint)stored.Length,
+                DecompressedSize = (uint)block.Length,
+                Flags = (ushort)(shrunk ? 3 : 0)
+            });
+        }
+        var info = new AssetBundleBlockAndDirInfo
+        {
+            Hash = new Hash128(),
+            BlockInfos = blocks.ToArray(),
+            DirectoryInfos = bundle.BlockAndDirInfo.DirectoryInfos
+        };
+        byte[] infoBytes;
+        using (var stream = new MemoryStream())
+        {
+            info.Write(new AssetsFileWriter(stream) { BigEndian = true });
+            infoBytes = stream.ToArray();
+        }
+        var packedInfo = LZ4Codec.Encode32HC(infoBytes, 0, infoBytes.Length);
+        var header = new AssetBundleHeader
+        {
+            Signature = bundle.Header.Signature,
+            Version = bundle.Header.Version,
+            GenerationVersion = bundle.Header.GenerationVersion,
+            EngineVersion = bundle.Header.EngineVersion,
+            FileStreamHeader = new AssetBundleFSHeader
+            {
+                CompressedSize = (uint)packedInfo.Length,
+                DecompressedSize = (uint)infoBytes.Length,
+                Flags = AssetBundleFSHeaderFlags.LZ4HCCompressed | AssetBundleFSHeaderFlags.HasDirectoryInfo
+            }
+        };
+        using var writer = new AssetsFileWriter(File.Create(path));
+        // The header's length does not depend on its sizes: write it once to learn where it ends, then again.
+        WriteHeader(writer, header);
+        header.FileStreamHeader.TotalFileSize = writer.Position + packedInfo.Length + data.Length;
+        writer.Write(packedInfo);
+        data.WriteTo(writer.BaseStream);
+        writer.Position = 0;
+        WriteHeader(writer, header);
+    }
+
+    static void WriteHeader(AssetsFileWriter writer, AssetBundleHeader header)
+    {
+        header.Write(writer);
+        if (header.Version >= 7)
+            writer.Align16();
+    }
+
+    /// <summary>
     /// Verifies that <paramref name="path"/> is LZ4-compressed the way a native
     /// <c>BuildAssetBundleOptions.ChunkBasedCompression</c> bundle is: the compression mode in the UnityFS header is
-    /// LZ4 or LZ4HC, and every data block is either an LZ4 block or an uncompressed block whose compressed and
-    /// decompressed sizes are equal. LZ4 cannot shrink data that is already compressed, and a chunk that does not
-    /// shrink is stored as-is with mode 0 — the audio banks (<c>.acb</c>) hit this, so requiring every block to be LZ4
-    /// would reject bundles that are perfectly fine. <c>GetCompressionType</c> cannot be used to check any of this,
-    /// because it reports the directory-info compression, which is a different thing and is usually "None".
+    /// LZ4 or LZ4HC, and every data block is either an LZ4 block that is smaller than its data or an uncompressed
+    /// block whose compressed and decompressed sizes are equal. LZ4 cannot shrink data that is already compressed,
+    /// and a chunk that does not shrink is stored as-is with mode 0 — the audio banks (<c>.acb</c>) hit this, so
+    /// requiring every block to be LZ4 would reject bundles that are perfectly fine. An LZ4 block that is not smaller
+    /// than its data is rejected: the player cannot read it (see <see cref="PackLz4"/>). <c>GetCompressionType</c>
+    /// cannot be used to check any of this, because it reports the directory-info compression, which is a different
+    /// thing and is usually "None".
     /// </summary>
     static void RequireLz4Bundle(string path, string source)
     {
@@ -330,7 +405,7 @@ public static class ModelBundlePlatformConverter
             foreach (var block in bundle.file.BlockAndDirInfo.BlockInfos)
             {
                 var blockMode = (uint)block.Flags & 0x3f;
-                if (blockMode is 2 or 3)
+                if (blockMode is 2 or 3 && block.CompressedSize < block.DecompressedSize)
                     continue;
                 // 存不下就原样存的块：声明成未压缩就必须真的是原样大小
                 if (blockMode == 0 && block.CompressedSize == block.DecompressedSize)
@@ -343,6 +418,25 @@ public static class ModelBundlePlatformConverter
         finally
         {
             manager.UnloadAll(true);
+        }
+    }
+
+    /// <summary>
+    /// Whether the header and block list of the converted bundle at <paramref name="path"/> can be read and pass
+    /// <see cref="RequireLz4Bundle"/>; the data itself is not read. A bundle converted before <see cref="PackLz4"/>
+    /// can hold an LZ4 block that is not smaller than its data, and the caller converts a bundle that fails this
+    /// check again instead of keeping it.
+    /// </summary>
+    public static bool IsLz4Bundle(string path)
+    {
+        try
+        {
+            RequireLz4Bundle(path, path);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
@@ -449,8 +543,21 @@ public static class ModelBundlePlatformConverter
         Enumerable.Range(0, bundle.BlockAndDirInfo.DirectoryInfos.Count)
             .Where(index => bundle.BlockAndDirInfo.DirectoryInfos[index].IsSerialized).ToArray();
 
-    static BundleFileInstance OpenBundle(AssetsManager manager, string path, bool unpackIfPacked) =>
-        manager.LoadBundleFile(path, unpackIfPacked);
+    static BundleFileInstance OpenBundle(AssetsManager manager, string path, bool unpackIfPacked)
+    {
+        // LoadBundleFile(path) opens the file itself and leaves it open when the bundle cannot be read: the manager
+        // only closes the bundles it loaded. An unreadable converted bundle must be free for its replacement.
+        var stream = File.OpenRead(path);
+        try
+        {
+            return manager.LoadBundleFile(stream, unpackIfPacked);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
 
     static void CopyVerified(string source, string output, string hash)
     {
