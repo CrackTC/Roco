@@ -15,4 +15,5 @@ public partial record IndexItem(
 public record AssetIndex(int Version, Dictionary<string, IndexItem> Items);
 
 [JsonSerializable(typeof(AssetIndex))]
+[JsonSerializable(typeof(Dictionary<string, string>))]
 internal partial class AssetServiceJsonSerializerContext : JsonSerializerContext;

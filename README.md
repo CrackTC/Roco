@@ -19,7 +19,7 @@ dotnet build Roco/Roco.csproj
   --index <路径>     指定 index.json 的路径（默认: index.json）
   --download <目录>  指定未转换包的下载目录（默认: downloads）
   --converted <目录> 指定已转换包的输出目录；每下载完成/跳过一个包就转换成 WebGL 包放进去，
-                     该目录下已有通过校验的同名包则跳过转换（对 download-all 必填）
+                     该目录下已有通过校验、不比源包旧的同名包则跳过转换（对 download-all 必填）
   --limit <个数>     只处理前 N 个资源，用于小批量试跑（默认: 0，即全部）
 ```
 
@@ -33,8 +33,15 @@ Roco.exe --converted converted --limit 20 download-all
 
 `download-all` 会把未转换的包放在 `--download`，把转换好的包写到 `--converted`：每个包下载完成或者因为
 本地已有同名同大小的包而跳过后，都会调用 `ModelBundlePlatformConverter` 把它转成 WebGL 包。
-该目录里有同名包时直接跳过转换；同名包没通过校验（读不出包头或块表，或者带着旧版本转出的、没压小却
-标成 LZ4 的块，播放器读不了）时会重新转换。`--limit` 只处理 index 里的前 N 个资源，试跑时用，避免一上来就拉全量。
+该目录里有同名包时直接跳过转换；同名包比源包旧（源包重新下载过），或者没通过校验（读不出包头或块表，
+或者带着旧版本转出的、没压小却标成 LZ4 的块，播放器读不了）时会重新转换。
+
+源包是不是最新，先看 index 里的 size，再看 hash：`--download` 目录里的 `.downloaded.json` 记着每个源包对应
+index 里的哪个 hash。hash 没变就当作文件没变；hash 变了而 size 没变的包会重新下载，和原来的源包比较内容，
+内容真的变了才换掉（两个 index 版本之间抽查 10 个这样的包，只有 1 个内容变了）。没有记录的包按 size 接受，并记成
+index 当前的 hash，所以在那之前发生的、size 没变的内容变化要等它的 hash 再变一次才会被发现。
+
+`--limit` 只处理 index 里的前 N 个资源，试跑时用，避免一上来就拉全量。
 
 转换后的包和下载下来的包**同名**：用的是 index 里的 key（本地文件名，形如 `ch_ex086_011ami.unity3d`），
 不是 `item.Name`（资源服务器上的 hash 文件名，形如 `9cc90a32….unity3d`）。下载时 `item.Name` 只用来拼 URL。

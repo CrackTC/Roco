@@ -64,7 +64,7 @@ internal sealed record CliOptions(
         Console.WriteLine("  --index <路径>     指定 index.json 的路径（默认: index.json）");
         Console.WriteLine("  --download <目录>  指定未转换包的下载目录（默认: downloads）");
         Console.WriteLine("  --converted <目录> 指定已转换包的输出目录；每下载完成/跳过一个包就转换成 WebGL 包放进去，" +
-            "该目录下已有通过校验的同名包则跳过转换（对 download-all 必填）");
+            "该目录下已有通过校验、不比源包旧的同名包则跳过转换（对 download-all 必填）");
         Console.WriteLine("  --limit <个数>     只处理前 N 个资源，用于小批量试跑（默认: 0，即全部）");
     }
 }
