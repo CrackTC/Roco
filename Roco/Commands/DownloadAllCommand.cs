@@ -1,7 +1,11 @@
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text.Json;
+
 namespace Roco.Commands;
 
 /// <summary>
-/// 下载全部资源：从 index 里逐条下载 bundle 到 --download，每下载完成（或因为本地已有同大小文件而跳过）
+/// 下载全部资源：从 index 里逐条下载 bundle 到 --download，每下载完成（或因为本地已有同一份文件而跳过）
 /// 一个包，就调用 <see cref="ModelBundlePlatformConverter"/> 把它转换成 WebGL 包写进 --converted；
 /// --converted 里已有同名包、通过校验且不比源包旧时跳过转换。
 /// </summary>
@@ -10,6 +14,19 @@ internal sealed class DownloadAllCommand
     const int MaxConcurrency = 5;
     const int MaxRetries = 3;
     const int RetryDelayMs = 2000;
+
+    /// <summary>
+    /// --download 目录里的记录：每个源包对应 index 里的哪个 hash（文件名 → hash）。同名的包换了内容而 size 没变时，
+    /// size 看不出来。两个 index 版本之间抽查：hash 没变的 10 个内容都没变（三个版本里也没有 hash 没变而 size 变了
+    /// 的条目），所以 hash 没变就当作文件没变；hash 变了而 size 没变的 10 个里只有 1 个内容变了，所以 hash 变了
+    /// 只用来决定要不要重新下载比较，换不换源包看内容。
+    /// 没有记录的包（记录出现之前下载的，或者下载后记录没存下来的）按 size 接受，并记成 index 当前的 hash：
+    /// 在那之前发生的、size 没变的内容变化要等它的 hash 再变一次才会被发现。
+    /// </summary>
+    const string DownloadedHashesFileName = ".downloaded.json";
+
+    /// <summary>每处理这么多个包存一次记录，进程中途被杀时已经下载好的包不至于没有记录。</summary>
+    const int SaveHashesEvery = 2000;
 
     /// <summary>输出同步用；<see cref="Console"/> 本身不是线程安全的。</summary>
     readonly object consoleLock = new();
@@ -26,6 +43,7 @@ internal sealed class DownloadAllCommand
     int converted;
     int convertFailed;
     int convertSkipped;
+    int processed;
 
     /// <summary>下载并转换；参数有问题时返回 false（错误已经打印过），调用方不要再报完成。</summary>
     public static bool Run(CommandContext context, CliOptions options)
@@ -59,6 +77,9 @@ internal sealed class DownloadAllCommand
 
         // 更新 index（写回本地 index.json）；拿不到新版本时用本地那份
         var index = UpdateIndexCommand.LoadOrFetch(context.IndexPath);
+        var hashesPath = Path.Combine(downloadRoot, DownloadedHashesFileName);
+        var hashes = new ConcurrentDictionary<string, string>(ReadDownloadedHashes(hashesPath));
+        var hashesLock = new object();
 
         var items = limit > 0 ? index.Items.Take(limit).ToList() : index.Items.ToList();
         var total = items.Count;
@@ -75,6 +96,22 @@ internal sealed class DownloadAllCommand
             lock (consoleLock)
             {
                 Console.WriteLine(message);
+            }
+        }
+
+        // 记录任何时候存下来都是对的：一个包的 hash 只在它的文件就位之后才记进去
+        void SaveHashes()
+        {
+            lock (hashesLock)
+            {
+                try
+                {
+                    WriteDownloadedHashes(hashesPath, hashes);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    Log($"写不了 {hashesPath}：{ex.Message}");
+                }
             }
         }
 
@@ -166,29 +203,72 @@ internal sealed class DownloadAllCommand
             await semaphore.WaitAsync().ConfigureAwait(false);
             try
             {
-                if (File.Exists(filePath))
+                var exists = File.Exists(filePath);
+                var sameSize = exists && new FileInfo(filePath).Length == item.Size;
+                if (sameSize && (!hashes.TryGetValue(key, out var hash) || hash == item.Hash))
                 {
-                    if (new FileInfo(filePath).Length == item.Size)
-                    {
-                        Log($"{label} {fileName} 已存在且 size 一致，跳过 download");
-                        Interlocked.Increment(ref skipped);
-                        // 跳过的包也要转换，除非目标目录里已经有通过校验、不比它旧的同名包
-                        ConvertBundle(label, fileName, filePath);
-                        ReportProgress(item.Size);
-                        return;
-                    }
+                    hashes[key] = item.Hash;
+                    Log($"{label} {fileName} 已存在且 size 一致，跳过 download");
+                    Interlocked.Increment(ref skipped);
+                    // 跳过的包也要转换，除非目标目录里已经有通过校验、不比它旧的同名包
+                    ConvertBundle(label, fileName, filePath);
+                    ReportProgress(item.Size);
+                    return;
+                }
 
+                // size 没变而 hash 变了的包下载到旁边，内容真的变了才换掉源包；内容没变就保留原来的源包，
+                // 它的时间不变，后面也就不会重新转换
+                var downloadPath = sameSize ? filePath + ".download" : filePath;
+                if (sameSize)
+                {
+                    Log($"{label} {fileName} hash 不一致，重新 download 后比较内容...");
+                }
+                else if (exists)
+                {
                     Log($"{label} {fileName} size 不一致，删除后重新 download 中...");
                     try { File.Delete(filePath); } catch { }
                 }
 
-                var success = await DownloadAsync(label, fileName, item.Name, index.Version, filePath).ConfigureAwait(false);
+                var success = await DownloadAsync(label, fileName, item.Name, index.Version, downloadPath).ConfigureAwait(false);
                 if (!success)
                 {
+                    // size 没变的那种情况原来的源包还在，记录也留着，下次再比
+                    if (!sameSize)
+                        hashes.TryRemove(key, out _);
                     Interlocked.Increment(ref failed);
                 }
                 else
                 {
+                    if (sameSize)
+                    {
+                        bool changed;
+                        try
+                        {
+                            changed = !SameContent(filePath, downloadPath);
+                            if (changed)
+                                File.Move(downloadPath, filePath, true);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            // 比不了或者换不了：原来的源包和记录都留着，下次再比
+                            try { File.Delete(downloadPath); } catch { }
+                            Log($"{label} {fileName} 比较内容失败：{ex.Message}");
+                            Interlocked.Increment(ref failed);
+                            ReportProgress(item.Size);
+                            return;
+                        }
+
+                        if (!changed)
+                        {
+                            try { File.Delete(downloadPath); } catch { }
+                        }
+
+                        Log(changed
+                            ? $"{label} {fileName} 内容变了，已换成新的源包"
+                            : $"{label} {fileName} 内容没变，保留原来的源包");
+                    }
+
+                    hashes[key] = item.Hash;
                     Interlocked.Increment(ref downloaded);
                     // download 完成的包立刻转换
                     ConvertBundle(label, fileName, filePath);
@@ -199,6 +279,8 @@ internal sealed class DownloadAllCommand
             finally
             {
                 semaphore.Release();
+                if (Interlocked.Increment(ref processed) % SaveHashesEvery == 0)
+                    SaveHashes();
             }
         }
 
@@ -256,7 +338,14 @@ internal sealed class DownloadAllCommand
         var tasks = items
             .Select((pair, position) => Task.Run(() => DownloadOneAsync(position, pair.Key, pair.Value)))
             .ToArray();
-        Task.WaitAll(tasks);
+        try
+        {
+            Task.WaitAll(tasks);
+        }
+        finally
+        {
+            SaveHashes();
+        }
 
         try
         {
@@ -276,5 +365,43 @@ internal sealed class DownloadAllCommand
             $"转换 {converted}，跳过转换 {convertSkipped}，转换失败 {convertFailed}"
         );
         return true;
+    }
+
+    static bool SameContent(string first, string second)
+    {
+        using var a = File.OpenRead(first);
+        using var b = File.OpenRead(second);
+        return a.Length == b.Length && SHA256.HashData(a).AsSpan().SequenceEqual(SHA256.HashData(b));
+    }
+
+    static Dictionary<string, string> ReadDownloadedHashes(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                using var stream = File.OpenRead(path);
+                return JsonSerializer.Deserialize(stream, AssetServiceJsonSerializerContext.Default.DictionaryStringString) ?? [];
+            }
+        }
+        catch (Exception ex) when (ex is JsonException or IOException)
+        {
+            Console.WriteLine($"读不了 {path}（{ex.Message}），这次只按 size 判断源包");
+        }
+
+        return [];
+    }
+
+    /// <summary>先写临时文件再改名，中断时不会留下半份记录。</summary>
+    static void WriteDownloadedHashes(string path, ConcurrentDictionary<string, string> hashes)
+    {
+        var temporary = path + ".tmp";
+        using (var stream = File.Create(temporary))
+        {
+            JsonSerializer.Serialize(stream, new Dictionary<string, string>(hashes),
+                AssetServiceJsonSerializerContext.Default.DictionaryStringString);
+        }
+
+        File.Move(temporary, path, true);
     }
 }
