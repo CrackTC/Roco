@@ -39,17 +39,18 @@ internal static class Program
         switch (options.Command)
         {
             case "update-index":
+                WarnDownloadAllOnlyOptions(options);
                 UpdateIndexCommand.Run(context);
                 Console.WriteLine("资源 index 的 update finished 的说");
                 return;
 
             case "decrypt":
-                WarnConvertedIsIgnored(options);
+                WarnDownloadAllOnlyOptions(options);
                 DecryptCommand.Run(context, options.RemainingArgs);
                 return;
 
             case "encrypt":
-                WarnConvertedIsIgnored(options);
+                WarnDownloadAllOnlyOptions(options);
                 EncryptCommand.Run(context, options.RemainingArgs);
                 return;
 
@@ -67,11 +68,16 @@ internal static class Program
         }
     }
 
-    static void WarnConvertedIsIgnored(CliOptions options)
+    static void WarnDownloadAllOnlyOptions(CliOptions options)
     {
         if (!string.IsNullOrWhiteSpace(options.ConvertedPath))
         {
             Console.WriteLine("--converted 只对 download-all 有效的说");
+        }
+
+        if (options.DeleteSource)
+        {
+            Console.WriteLine("--delete-source 只对 download-all 有效的说");
         }
     }
 }

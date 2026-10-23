@@ -13,7 +13,7 @@ dotnet build Roco/Roco.csproj
 解密: Roco [--index <index路径>] [--download <下载目录>] decrypt <bundle文件路径>
 加密: Roco [--index <index路径>] [--download <下载目录>] encrypt <要 patch 的源文件> [bundle文件路径]
 更新资源 index: Roco [--index <index路径>] update-index
-下载全部资源:   Roco [--index <index路径>] [--download <下载目录>] --converted <已转换包目录> [--limit <个数>] download-all
+下载全部资源:   Roco [--index <index路径>] [--download <下载目录>] --converted <已转换包目录> [--limit <个数>] [--delete-source] download-all
 
 选项：
   --index <路径>     指定 index.json 的路径（默认: index.json）
@@ -21,6 +21,8 @@ dotnet build Roco/Roco.csproj
   --converted <目录> 指定已转换包的输出目录；每下载完成/跳过一个包就转换成 WebGL 包放进去，
                      该目录下已有通过校验、不比源包旧的同名包则跳过转换（对 download-all 必填）
   --limit <个数>     只处理前 N 个资源，用于小批量试跑（默认: 0，即全部）
+  --delete-source    包转换成功后删除 --download 里的源包；下次运行 hash 没变就直接跳过下载和转换，
+                     hash 变了才重新下载、重新转换（只对 download-all 有效）
 ```
 
 先小批量试跑再跑全量：
@@ -35,6 +37,12 @@ Roco.exe --converted converted --limit 20 download-all
 本地已有同名同大小的包而跳过后，都会调用 `ModelBundlePlatformConverter` 把它转成 WebGL 包。
 该目录里有同名包时直接跳过转换；同名包比源包旧（源包重新下载过），或者没通过校验（读不出包头或块表，
 或者带着旧版本转出的、没压小却标成 LZ4 的块，播放器读不了）时会重新转换。
+
+加 `--delete-source` 后，转换包可用了就删掉 `--download` 里的源包（转换失败时留着，下次直接拿它重试）。
+转换成功的包记在 `--converted/.converted.json`（源包文件名 → 转出它的源包 hash）：下次运行源包不在、
+记录里的 hash 和 index 一致、转换包又通过校验，就直接跳过下载和转换；hash 变了，或者转换包缺失、没通过
+校验，就重新下载、重新转换。记录和 `.downloaded.json` 一样每 2000 个包、以及运行结束时存一次，进程中途
+被杀最多让最近一段包重新下载，不会丢掉转换好的包。
 
 源包是不是最新，先看 index 里的 size，再看 hash：`--download` 目录里的 `.downloaded.json` 记着每个源包对应
 index 里的哪个 hash。hash 没变就当作文件没变；hash 变了而 size 没变的包会重新下载，和原来的源包比较内容，
