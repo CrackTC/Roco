@@ -37,6 +37,16 @@ internal sealed class DownloadAllCommand
     /// <summary>每处理这么多个包存一次记录，进程中途被杀时已经下载好的包不至于没有记录。</summary>
     const int SaveHashesEvery = 2000;
 
+    /// <summary>
+    /// --converted 目录里的记录：上一次没有任何下载、比较或转换失败的完整运行（没有 --limit）用的 index 版本。
+    /// 有失败的运行不更新它，下一次同一版本还会再处理一遍，失败的包有机会重试。
+    /// </summary>
+    const string CompletedVersionFileName = ".completed-version";
+
+    /// <summary>进度每处理这么多个包、或者离上一次进度这么久，打一次。</summary>
+    const int ProgressEvery = 1000;
+    const long ProgressIntervalMs = 10_000;
+
     /// <summary>输出同步用；<see cref="Console"/> 本身不是线程安全的。</summary>
     readonly object consoleLock = new();
 
@@ -55,6 +65,8 @@ internal sealed class DownloadAllCommand
     int deleted;
     int deleteFailed;
     int processed;
+    int reported;
+    long lastProgressTime;
 
     /// <summary>下载并转换；参数有问题时返回 false（错误已经打印过），调用方不要再报完成。</summary>
     public static bool Run(CommandContext context, CliOptions options)
@@ -88,6 +100,13 @@ internal sealed class DownloadAllCommand
 
         // 更新 index（写回本地 index.json）；拿不到新版本时用本地那份
         var index = UpdateIndexCommand.LoadOrFetch(context.IndexPath);
+        var completedVersionPath = Path.Combine(convertedRoot, CompletedVersionFileName);
+        if (limit <= 0 && ReadCompletedVersion(completedVersionPath) == index.Version)
+        {
+            Console.WriteLine($"index version {index.Version} 上次已经全部处理完，没有失败，这次跳过");
+            return true;
+        }
+
         var hashesPath = Path.Combine(downloadRoot, DownloadedHashesFileName);
         var hashes = new ConcurrentDictionary<string, string>(ReadHashes(hashesPath));
         var convertedHashesPath = Path.Combine(convertedRoot, ConvertedHashesFileName);
@@ -138,14 +157,21 @@ internal sealed class DownloadAllCommand
             }
         }
 
+        // 跳过的包不逐条打印，进度也只是每 ProgressEvery 个包或每 ProgressIntervalMs 打一次（最后一个包一定打）
+        lastProgressTime = Environment.TickCount64;
         void ReportProgress(uint addedSize)
         {
             lock (consoleLock)
             {
+                downloadSize += addedSize;
+                var count = ++reported;
+                var now = Environment.TickCount64;
+                if (count % ProgressEvery != 0 && count != total && now - lastProgressTime < ProgressIntervalMs)
+                    return;
+                lastProgressTime = now;
                 var ok = Volatile.Read(ref downloaded);
                 var skip = Volatile.Read(ref skipped);
                 var fail = Volatile.Read(ref failed);
-                downloadSize += addedSize;
                 Console.WriteLine(
                     $"{downloadSize * 100.0 / totalSize:F2}% 进度：{downloadSize / 1024.0 / 1024.0:F2} MB / {totalSize / 1024.0 / 1024.0:F2} MB {ok + skip + fail}/{total}（下载 {ok}，跳过 {skip}，失败 {fail}，转换 {Volatile.Read(ref converted)}）"
                 );
@@ -160,19 +186,14 @@ internal sealed class DownloadAllCommand
             if (File.Exists(targetPath))
             {
                 // 源包比已转换包新：同名的包在 index 里换了内容、重新下载过，已转换包还是旧内容转出来的
-                var outdated = File.GetLastWriteTimeUtc(sourcePath) > File.GetLastWriteTimeUtc(targetPath);
-                if (!outdated && ModelBundlePlatformConverter.IsLz4Bundle(targetPath))
+                if (File.GetLastWriteTimeUtc(sourcePath) <= File.GetLastWriteTimeUtc(targetPath))
                 {
-                    Log($"{position} {fileName} 已转换包已存在，跳过转换");
                     Interlocked.Increment(ref convertSkipped);
                     convertedHashes[fileName] = hash;
                     return true;
                 }
 
-                // 读不出包头或块表的包，以及旧版转换出来、带着播放器读不了的数据块（没压小却标成 LZ4）的包，也要重新转换
-                Log(outdated
-                    ? $"{position} {fileName} 源包比已转换包新，重新转换"
-                    : $"{position} {fileName} 已转换包没通过校验，重新转换");
+                Log($"{position} {fileName} 源包比已转换包新，重新转换");
             }
 
             var temporaryPath = Path.Combine(temporaryRoot, fileName + "." + Guid.NewGuid().ToString("N") + ".tmp");
@@ -281,7 +302,6 @@ internal sealed class DownloadAllCommand
                 if (sameSize && (!hashes.TryGetValue(key, out var hash) || hash == item.Hash))
                 {
                     hashes[key] = item.Hash;
-                    Log($"{label} {fileName} 已存在且 size 一致，跳过 download");
                     Interlocked.Increment(ref skipped);
                     // 跳过的包也要转换，除非目标目录里已经有通过校验、不比它旧的同名包
                     ConvertAndDeleteSource(label, fileName, filePath, item.Hash);
@@ -428,6 +448,18 @@ internal sealed class DownloadAllCommand
         }
         catch { }
 
+        if (limit <= 0 && failed == 0 && convertFailed == 0)
+        {
+            try
+            {
+                File.WriteAllText(completedVersionPath, index.Version.ToString());
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.WriteLine($"写不了 {completedVersionPath}：{ex.Message}");
+            }
+        }
+
         var succeeded = downloaded + skipped + failed;
         if (succeeded != total)
         {
@@ -443,6 +475,18 @@ internal sealed class DownloadAllCommand
         }
         Console.WriteLine(summary);
         return true;
+    }
+
+    static int? ReadCompletedVersion(string path)
+    {
+        try
+        {
+            return File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out var version) ? version : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     static bool SameContent(string first, string second)

@@ -422,25 +422,6 @@ public static class ModelBundlePlatformConverter
     }
 
     /// <summary>
-    /// Whether the header and block list of the converted bundle at <paramref name="path"/> can be read and pass
-    /// <see cref="RequireLz4Bundle"/>; the data itself is not read. A bundle converted before <see cref="PackLz4"/>
-    /// can hold an LZ4 block that is not smaller than its data, and the caller converts a bundle that fails this
-    /// check again instead of keeping it.
-    /// </summary>
-    public static bool IsLz4Bundle(string path)
-    {
-        try
-        {
-            RequireLz4Bundle(path, path);
-            return true;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
     /// The compression mode in the first 6 bits of the UnityFS header of <paramref name="path"/>: 0 none, 1 LZMA,
     /// 2 LZ4, 3 LZ4HC.
     /// </summary>
