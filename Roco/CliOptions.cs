@@ -5,6 +5,7 @@ internal sealed record CliOptions(
     string IndexPath,
     string DownloadPath,
     string? ConvertedPath,
+    bool DeleteSource,
     int Limit,
     string? Command,
     List<string> RemainingArgs)
@@ -15,6 +16,7 @@ internal sealed record CliOptions(
         var indexPath = "index.json";
         var downloadPath = "downloads";
         string? convertedPath = null;
+        var deleteSource = false;
         var limit = 0;
         var remainingArgs = new List<string>();
         for (var i = 0; i < args.Length; i++)
@@ -29,6 +31,9 @@ internal sealed record CliOptions(
                     break;
                 case "--converted" when i + 1 < args.Length:
                     convertedPath = args[++i];
+                    break;
+                case "--delete-source":
+                    deleteSource = true;
                     break;
                 case "--limit" when i + 1 < args.Length:
                     var text = args[++i];
@@ -45,7 +50,7 @@ internal sealed record CliOptions(
             }
         }
 
-        options = new CliOptions(indexPath, downloadPath, convertedPath, limit,
+        options = new CliOptions(indexPath, downloadPath, convertedPath, deleteSource, limit,
             remainingArgs.Count > 0 ? remainingArgs[0] : null, remainingArgs);
         error = null;
         return true;
@@ -58,7 +63,7 @@ internal sealed record CliOptions(
         Console.WriteLine($"解密: {name} [--index <index路径>] [--download <下载目录>] decrypt <bundle文件路径>");
         Console.WriteLine($"加密: {name} [--index <index路径>] [--download <下载目录>] encrypt <要 patch 的源文件> [bundle文件路径]");
         Console.WriteLine($"更新资源 index: {name} [--index <index路径>] update-index");
-        Console.WriteLine($"下载全部资源:   {name} [--index <index路径>] [--download <下载目录>] --converted <已转换包目录> [--limit <个数>] download-all");
+        Console.WriteLine($"下载全部资源:   {name} [--index <index路径>] [--download <下载目录>] --converted <已转换包目录> [--limit <个数>] [--delete-source] download-all");
         Console.WriteLine();
         Console.WriteLine("选项：");
         Console.WriteLine("  --index <路径>     指定 index.json 的路径（默认: index.json）");
@@ -66,6 +71,8 @@ internal sealed record CliOptions(
         Console.WriteLine("  --converted <目录> 指定已转换包的输出目录；每下载完成/跳过一个包就转换成 WebGL 包放进去，" +
             "该目录下已有通过校验、不比源包旧的同名包则跳过转换（对 download-all 必填）");
         Console.WriteLine("  --limit <个数>     只处理前 N 个资源，用于小批量试跑（默认: 0，即全部）");
+        Console.WriteLine("  --delete-source    包转换成功后删除 --download 里转换前的源包；下次运行 hash 没变就直接跳过" +
+            "下载和转换，hash 变了才重新下载、重新转换（只对 download-all 有效）");
     }
 }
 

@@ -7,8 +7,9 @@ namespace Roco.Commands;
 /// <summary>
 /// 下载全部资源：从 index 里逐条下载 bundle 到 --download，每下载完成（或因为本地已有同一份文件而跳过）
 /// 一个包，就调用 <see cref="ModelBundlePlatformConverter"/> 把它转换成 WebGL 包写进 --converted；
-/// --converted 里已有同名包且不比源包旧时跳过转换。
-/// 上一次完整运行没有任何失败时记下它的 index 版本，版本没变的下一次运行直接结束。
+/// --converted 里已有同名包、通过校验且不比源包旧时跳过转换。
+/// --delete-source 时转换成功（包括沿用已有转换包）后删掉 --download 里的源包；转换记录留在 --converted 里，
+/// 下次 hash 没变就直接跳过下载和转换，hash 变了再重新下载、重新转换。
 /// </summary>
 internal sealed class DownloadAllCommand
 {
@@ -25,6 +26,13 @@ internal sealed class DownloadAllCommand
     /// 在那之前发生的、size 没变的内容变化要等它的 hash 再变一次才会被发现。
     /// </summary>
     const string DownloadedHashesFileName = ".downloaded.json";
+
+    /// <summary>
+    /// --converted 目录里的转换记录（源包文件名 → 转出同名转换包的源包 hash）。--delete-source 删掉源包之后，
+    /// 下次只能靠这份记录判断包已经转好：记录里的 hash 和 index 一致、同名转换包又通过校验时跳过下载和转换；
+    /// hash 变了（或者转换包缺失、没通过校验）就重新下载、重新转换。
+    /// </summary>
+    const string ConvertedHashesFileName = ".converted.json";
 
     /// <summary>每处理这么多个包存一次记录，进程中途被杀时已经下载好的包不至于没有记录。</summary>
     const int SaveHashesEvery = 2000;
@@ -54,6 +62,8 @@ internal sealed class DownloadAllCommand
     int converted;
     int convertFailed;
     int convertSkipped;
+    int deleted;
+    int deleteFailed;
     int processed;
     int reported;
     long lastProgressTime;
@@ -68,10 +78,10 @@ internal sealed class DownloadAllCommand
             return false;
         }
 
-        return new DownloadAllCommand().Execute(context, converted, options.Limit);
+        return new DownloadAllCommand().Execute(context, converted, options.Limit, options.DeleteSource);
     }
 
-    bool Execute(CommandContext context, string convertedPath, int limit)
+    bool Execute(CommandContext context, string convertedPath, int limit, bool deleteSource)
     {
         // 未转换的包和已转换的包是两个目录：转换好的包写到 --converted，源包留在 --download
         downloadRoot = Path.GetFullPath(context.DownloadPath);
@@ -98,7 +108,9 @@ internal sealed class DownloadAllCommand
         }
 
         var hashesPath = Path.Combine(downloadRoot, DownloadedHashesFileName);
-        var hashes = new ConcurrentDictionary<string, string>(ReadDownloadedHashes(hashesPath));
+        var hashes = new ConcurrentDictionary<string, string>(ReadHashes(hashesPath));
+        var convertedHashesPath = Path.Combine(convertedRoot, ConvertedHashesFileName);
+        var convertedHashes = new ConcurrentDictionary<string, string>(ReadHashes(convertedHashesPath));
         var hashesLock = new object();
 
         var items = limit > 0 ? index.Items.Take(limit).ToList() : index.Items.ToList();
@@ -107,7 +119,7 @@ internal sealed class DownloadAllCommand
         Console.WriteLine($"共 {total} 个资源，总大小 {totalSize / 1024.0 / 1024.0:F2} MB"
             + (limit > 0 ? $"（只处理前 {limit} 个）" : ""));
         Console.WriteLine($"未转换的包：{downloadRoot}");
-        Console.WriteLine($"已转换的包：{convertedRoot}");
+        Console.WriteLine($"已转换的包：{convertedRoot}" + (deleteSource ? "（转换成功后删除源包）" : ""));
         using var httpClient = new HttpClient();
         using var semaphore = new SemaphoreSlim(MaxConcurrency);
 
@@ -119,19 +131,29 @@ internal sealed class DownloadAllCommand
             }
         }
 
-        // 记录任何时候存下来都是对的：一个包的 hash 只在它的文件就位之后才记进去
+        // 记录任何时候存下来都是对的：一个包的 hash 只在它的文件就位之后才记进去。
+        // 转换记录只有在 --delete-source 用过（文件已存在）或者这次要删源包时才写，不用这个选项就不动 --converted。
         void SaveHashes()
         {
             lock (hashesLock)
             {
-                try
+                SaveHashesFile(hashesPath, hashes);
+                if (deleteSource || File.Exists(convertedHashesPath))
                 {
-                    WriteDownloadedHashes(hashesPath, hashes);
+                    SaveHashesFile(convertedHashesPath, convertedHashes);
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    Log($"写不了 {hashesPath}：{ex.Message}");
-                }
+            }
+        }
+
+        void SaveHashesFile(string path, ConcurrentDictionary<string, string> values)
+        {
+            try
+            {
+                WriteHashes(path, values);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log($"写不了 {path}：{ex.Message}");
             }
         }
 
@@ -156,8 +178,9 @@ internal sealed class DownloadAllCommand
             }
         }
 
-        // 下载完成或跳过后调用：把未转换的包转成 WebGL 包，输出到临时目录再替换到 --converted 里的同名包
-        void ConvertBundle(string position, string fileName, string sourcePath)
+        // 下载完成或跳过后调用：把未转换的包转成 WebGL 包，输出到临时目录再替换到 --converted 里的同名包。
+        // 返回转换包是否可用（这次转成功，或者已有的同名包通过校验）；失败时源包要留着下次再转。
+        bool ConvertBundle(string position, string fileName, string sourcePath, string hash)
         {
             var targetPath = Path.Combine(convertedRoot, fileName);
             if (File.Exists(targetPath))
@@ -166,7 +189,8 @@ internal sealed class DownloadAllCommand
                 if (File.GetLastWriteTimeUtc(sourcePath) <= File.GetLastWriteTimeUtc(targetPath))
                 {
                     Interlocked.Increment(ref convertSkipped);
-                    return;
+                    convertedHashes[fileName] = hash;
+                    return true;
                 }
 
                 Log($"{position} {fileName} 源包比已转换包新，重新转换");
@@ -181,6 +205,8 @@ internal sealed class DownloadAllCommand
                 // 转换出来的文件已经在临时目录里，校验通过后才放进 --converted
                 ModelBundlePlatformConverter.Install(temporaryPath, targetPath);
                 Interlocked.Increment(ref converted);
+                // 有了这份记录，删掉源包之后下次还能知道这个 hash 已经转好
+                convertedHashes[fileName] = hash;
                 var log = $"{position} {fileName} 转换完成：{result.ObjectCount} 对象校验通过，"
                     + $"{new FileInfo(targetPath).Length / 1024.0:F0} KB，耗时 {Environment.TickCount64 - startTime} ms";
                 if (result.TextureCount > 0)
@@ -191,11 +217,13 @@ internal sealed class DownloadAllCommand
                 if (result.Messages.LastOrDefault(m => m.Contains("other bundle", StringComparison.Ordinal)) is { } note)
                     log += "；" + note[(note.IndexOf(';') + 1)..].Trim();
                 Log(log);
+                return true;
             }
             catch (Exception ex)
             {
                 Interlocked.Increment(ref convertFailed);
                 Log($"{position} {fileName} 转换失败：{ex.Message}");
+                return false;
             }
             finally
             {
@@ -205,6 +233,29 @@ internal sealed class DownloadAllCommand
                         File.Delete(temporaryPath);
                 }
                 catch { }
+            }
+        }
+
+        // --delete-source：转换包可用了才删源包。转换失败时必须留着，下次直接用这份源包重试；
+        // 转换包已经可用（这次转好或已有同名包通过校验）时，源包对它就没用了。
+        void ConvertAndDeleteSource(string position, string fileName, string sourcePath, string hash)
+        {
+            if (!ConvertBundle(position, fileName, sourcePath, hash))
+                return;
+
+            if (!deleteSource)
+                return;
+
+            try
+            {
+                File.Delete(sourcePath);
+                Interlocked.Increment(ref deleted);
+                Log($"{position} {fileName} 已转好，删除转换前的源包");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Interlocked.Increment(ref deleteFailed);
+                Log($"{position} {fileName} 删除源包失败：{ex.Message}");
             }
         }
 
@@ -227,12 +278,33 @@ internal sealed class DownloadAllCommand
             {
                 var exists = File.Exists(filePath);
                 var sameSize = exists && new FileInfo(filePath).Length == item.Size;
+
+                // --delete-source 删掉源包后，只能靠转换记录判断这个包已经转好：记录里的 hash 没变、转换包也通过
+                // 校验，就跳过下载和转换；hash 变了则记录对不上，照常重新下载、重新转换。
+                if (!exists
+                    && convertedHashes.TryGetValue(fileName, out var convertedHash)
+                    && convertedHash == item.Hash)
+                {
+                    var targetPath = Path.Combine(convertedRoot, fileName);
+                    if (ModelBundlePlatformConverter.IsLz4Bundle(targetPath))
+                    {
+                        hashes[key] = item.Hash;
+                        Log($"{label} {fileName} 源包已删除、hash 未变且转换包有效，跳过 download 和转换");
+                        Interlocked.Increment(ref skipped);
+                        Interlocked.Increment(ref convertSkipped);
+                        ReportProgress(item.Size);
+                        return;
+                    }
+
+                    Log($"{label} {fileName} 转换包缺失或没通过校验，重新 download 后重新转换");
+                }
+
                 if (sameSize && (!hashes.TryGetValue(key, out var hash) || hash == item.Hash))
                 {
                     hashes[key] = item.Hash;
                     Interlocked.Increment(ref skipped);
                     // 跳过的包也要转换，除非目标目录里已经有通过校验、不比它旧的同名包
-                    ConvertBundle(label, fileName, filePath);
+                    ConvertAndDeleteSource(label, fileName, filePath, item.Hash);
                     ReportProgress(item.Size);
                     return;
                 }
@@ -292,7 +364,7 @@ internal sealed class DownloadAllCommand
                     hashes[key] = item.Hash;
                     Interlocked.Increment(ref downloaded);
                     // download 完成的包立刻转换
-                    ConvertBundle(label, fileName, filePath);
+                    ConvertAndDeleteSource(label, fileName, filePath, item.Hash);
                 }
 
                 ReportProgress(item.Size);
@@ -393,10 +465,15 @@ internal sealed class DownloadAllCommand
         {
             Console.WriteLine($"注意：下载 {downloaded} + 跳过 {skipped} + 失败 {failed} = {succeeded}，和处理数 {total} 不一致");
         }
-        Console.WriteLine(
-            $"全部完成：共 {total}，下载 {downloaded}，跳过 download {skipped}，失败 {failed}；" +
-            $"转换 {converted}，跳过转换 {convertSkipped}，转换失败 {convertFailed}"
-        );
+        var summary = $"全部完成：共 {total}，下载 {downloaded}，跳过 download {skipped}，失败 {failed}；" +
+            $"转换 {converted}，跳过转换 {convertSkipped}，转换失败 {convertFailed}";
+        if (deleteSource)
+        {
+            summary += $"，删除源包 {deleted}";
+            if (deleteFailed > 0)
+                summary += $"，删除失败 {deleteFailed}";
+        }
+        Console.WriteLine(summary);
         return true;
     }
 
@@ -419,7 +496,7 @@ internal sealed class DownloadAllCommand
         return a.Length == b.Length && SHA256.HashData(a).AsSpan().SequenceEqual(SHA256.HashData(b));
     }
 
-    static Dictionary<string, string> ReadDownloadedHashes(string path)
+    static Dictionary<string, string> ReadHashes(string path)
     {
         try
         {
@@ -431,14 +508,14 @@ internal sealed class DownloadAllCommand
         }
         catch (Exception ex) when (ex is JsonException or IOException)
         {
-            Console.WriteLine($"读不了 {path}（{ex.Message}），这次只按 size 判断源包");
+            Console.WriteLine($"读不了 {path}（{ex.Message}），本次忽略这份记录");
         }
 
         return [];
     }
 
     /// <summary>先写临时文件再改名，中断时不会留下半份记录。</summary>
-    static void WriteDownloadedHashes(string path, ConcurrentDictionary<string, string> hashes)
+    static void WriteHashes(string path, ConcurrentDictionary<string, string> hashes)
     {
         var temporary = path + ".tmp";
         using (var stream = File.Create(temporary))
