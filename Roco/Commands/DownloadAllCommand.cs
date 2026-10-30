@@ -7,7 +7,7 @@ namespace Roco.Commands;
 /// <summary>
 /// 下载全部资源：从 index 里逐条下载 bundle 到 --download，每下载完成（或因为本地已有同一份文件而跳过）
 /// 一个包，就调用 <see cref="ModelBundlePlatformConverter"/> 把它转换成 WebGL 包写进 --converted；
-/// --converted 里已有同名包、通过校验且不比源包旧时跳过转换。
+/// --converted 里已有同名包且不比源包旧时跳过转换。
 /// --delete-source 时转换成功（包括沿用已有转换包）后删掉 --download 里的源包；转换记录留在 --converted 里，
 /// 下次 hash 没变就直接跳过下载和转换，hash 变了再重新下载、重新转换。
 /// </summary>
@@ -29,8 +29,8 @@ internal sealed class DownloadAllCommand
 
     /// <summary>
     /// --converted 目录里的转换记录（源包文件名 → 转出同名转换包的源包 hash）。--delete-source 删掉源包之后，
-    /// 下次只能靠这份记录判断包已经转好：记录里的 hash 和 index 一致、同名转换包又通过校验时跳过下载和转换；
-    /// hash 变了（或者转换包缺失、没通过校验）就重新下载、重新转换。
+    /// 下次只能靠这份记录判断包已经转好：记录里的 hash 和 index 一致、同名转换包也还在时跳过下载和转换；
+    /// hash 变了（或者转换包缺失）就重新下载、重新转换。
     /// </summary>
     const string ConvertedHashesFileName = ".converted.json";
 
@@ -179,7 +179,7 @@ internal sealed class DownloadAllCommand
         }
 
         // 下载完成或跳过后调用：把未转换的包转成 WebGL 包，输出到临时目录再替换到 --converted 里的同名包。
-        // 返回转换包是否可用（这次转成功，或者已有的同名包通过校验）；失败时源包要留着下次再转。
+        // 返回转换包是否可用（这次转成功，或者已有不比源包旧的同名包）；失败时源包要留着下次再转。
         bool ConvertBundle(string position, string fileName, string sourcePath, string hash)
         {
             var targetPath = Path.Combine(convertedRoot, fileName);
@@ -237,7 +237,7 @@ internal sealed class DownloadAllCommand
         }
 
         // --delete-source：转换包可用了才删源包。转换失败时必须留着，下次直接用这份源包重试；
-        // 转换包已经可用（这次转好或已有同名包通过校验）时，源包对它就没用了。
+        // 转换包已经可用（这次转好或已有不比源包旧的同名包）时，源包对它就没用了。
         void ConvertAndDeleteSource(string position, string fileName, string sourcePath, string hash)
         {
             if (!ConvertBundle(position, fileName, sourcePath, hash))
@@ -279,24 +279,23 @@ internal sealed class DownloadAllCommand
                 var exists = File.Exists(filePath);
                 var sameSize = exists && new FileInfo(filePath).Length == item.Size;
 
-                // --delete-source 删掉源包后，只能靠转换记录判断这个包已经转好：记录里的 hash 没变、转换包也通过
-                // 校验，就跳过下载和转换；hash 变了则记录对不上，照常重新下载、重新转换。
+                // --delete-source 删掉源包后，只能靠转换记录判断这个包已经转好：记录里的 hash 没变、转换包也还在，
+                // 就跳过下载和转换（和已有转换包一样不再读它的头校验）；hash 变了则记录对不上，照常重新下载、重新转换。
                 if (!exists
                     && convertedHashes.TryGetValue(fileName, out var convertedHash)
                     && convertedHash == item.Hash)
                 {
                     var targetPath = Path.Combine(convertedRoot, fileName);
-                    if (ModelBundlePlatformConverter.IsLz4Bundle(targetPath))
+                    if (File.Exists(targetPath))
                     {
                         hashes[key] = item.Hash;
-                        Log($"{label} {fileName} 源包已删除、hash 未变且转换包有效，跳过 download 和转换");
                         Interlocked.Increment(ref skipped);
                         Interlocked.Increment(ref convertSkipped);
                         ReportProgress(item.Size);
                         return;
                     }
 
-                    Log($"{label} {fileName} 转换包缺失或没通过校验，重新 download 后重新转换");
+                    Log($"{label} {fileName} 转换包缺失，重新 download 后重新转换");
                 }
 
                 if (sameSize && (!hashes.TryGetValue(key, out var hash) || hash == item.Hash))
